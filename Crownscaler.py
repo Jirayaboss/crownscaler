@@ -98,6 +98,33 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                 return resolved_path
         return "/dev/null"
 
+    @staticmethod
+    def _parse_byte_range(range_header, size):
+        """Return an inclusive byte range, or ``None`` when it is invalid."""
+        if size <= 0 or not range_header:
+            return None
+
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+        if not match:
+            return None
+
+        start_text, end_text = match.groups()
+        if not start_text and not end_text:
+            return None
+        if not start_text:
+            suffix_len = int(end_text)
+            if suffix_len <= 0:
+                return None
+            return max(0, size - suffix_len), size - 1
+
+        first_byte = int(start_text)
+        if first_byte >= size:
+            return None
+        last_byte = int(end_text) if end_text else size - 1
+        if last_byte < first_byte:
+            return None
+        return first_byte, min(last_byte, size - 1)
+
     def send_head(self):
         path = self.translate_path(self.path)
         f = None
@@ -120,26 +147,15 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
             )
 
             if "Range" in self.headers:
-                try:
-                    range_str = self.headers["Range"].replace("bytes=", "").strip()
-                    if range_str.startswith("-"):
-                        suffix_len = int(range_str[1:])
-                        first_byte = max(0, size - suffix_len)
-                        last_byte = size - 1
-                    else:
-                        parts = range_str.split("-")
-                        first_byte = int(parts[0]) if parts[0] else 0
-                        last_byte = (
-                            int(parts[1]) if len(parts) > 1 and parts[1] else size - 1
-                        )
-                    length = last_byte - first_byte + 1
-                except Exception:
-                    self.send_response(http.server.HTTPStatus.OK)
-                    self.send_header("Content-Type", mime_type)
-                    self.send_header("Content-Length", str(size))
-                    self.send_header("Accept-Ranges", "bytes")
+                byte_range = self._parse_byte_range(self.headers["Range"], size)
+                if byte_range is None:
+                    f.close()
+                    self.send_response(http.server.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
                     self.end_headers()
-                    return f
+                    return None
+                first_byte, last_byte = byte_range
+                length = last_byte - first_byte + 1
 
                 self.send_response(http.server.HTTPStatus.PARTIAL_CONTENT)
                 self.send_header("Content-Type", mime_type)
@@ -164,20 +180,11 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
 
     def copyfile(self, source, outputfile):
         if "Range" in self.headers:
-            try:
-                range_str = self.headers["Range"].replace("bytes=", "").strip()
-                if range_str.startswith("-"):
-                    suffix_len = int(range_str[1:])
-                    first_byte = max(0, os.fstat(source.fileno()).st_size - suffix_len)
-                    last_byte = os.fstat(source.fileno()).st_size - 1
-                else:
-                    parts = range_str.split("-")
-                    first_byte = int(parts[0]) if parts[0] else 0
-                    last_byte = (
-                        int(parts[1])
-                        if len(parts) > 1 and parts[1]
-                        else os.fstat(source.fileno()).st_size - 1
-                    )
+            byte_range = self._parse_byte_range(
+                self.headers["Range"], os.fstat(source.fileno()).st_size
+            )
+            if byte_range is not None:
+                first_byte, last_byte = byte_range
                 length = last_byte - first_byte + 1
                 chunk_size = 1024 * 64
                 while length > 0:
@@ -187,8 +194,6 @@ class RangeRequestHandler(http.server.SimpleHTTPRequestHandler):
                     outputfile.write(data)
                     length -= len(data)
                 return
-            except Exception:
-                pass
         super().copyfile(source, outputfile)
 
     def log_message(self, format, *args):
@@ -584,8 +589,9 @@ def handle_upload_chunk(filename, b64_data, is_first, is_last=False):
     final_path = os.path.join(_I_D_X, clean_name)
     mode = "wb" if is_first else "ab"
     try:
+        chunk = base64.b64decode(b64_data, validate=True)
         with open(part_path, mode) as f:
-            f.write(base64.b64decode(b64_data))
+            f.write(chunk)
         if is_last and os.path.exists(part_path):
             if os.path.exists(final_path):
                 final_path = get_unique_filepath(_I_D_X, clean_name)
@@ -685,8 +691,9 @@ def handle_model_upload_chunk(filename, b64_data, is_first, is_last=False):
     mode = "wb" if is_first else "ab"
 
     try:
+        chunk = base64.b64decode(b64_data, validate=True)
         with open(part_path, mode) as f:
-            f.write(base64.b64decode(b64_data))
+            f.write(chunk)
         if is_last and os.path.exists(part_path):
             os.replace(part_path, dest_path)
 
@@ -1140,6 +1147,23 @@ def build_microwave_lut():
     return np.array(lut_x, dtype=np.float32), np.array(lut_y, dtype=np.float32)
 
 
+def build_atempo_filter(speed_factor):
+    """Build a valid FFmpeg atempo chain for a positive playback speed."""
+    speed = float(speed_factor)
+    if speed <= 0:
+        raise ValueError("Speed factor must be greater than zero.")
+
+    filters = []
+    while speed < 0.5:
+        filters.append("atempo=0.5")
+        speed /= 0.5
+    while speed > 2.0:
+        filters.append("atempo=2.0")
+        speed /= 2.0
+    filters.append(f"atempo={speed:.8g}")
+    return ",".join(filters)
+
+
 # ==============================================================================
 # 7. COMPUTE CORE PIPELINE
 # ==============================================================================
@@ -1237,6 +1261,8 @@ def run_pipeline(config):
         remove_dead_requested = bool(config.get("removeDeadFrames", False))
         dead_threshold = float(config.get("deadThreshold", 3.0))
         speed_factor = float(config.get("speedFactor", 1.0))
+        if speed_factor <= 0:
+            raise ValueError("Speed factor must be greater than zero.")
 
         reverse_remap_requested = bool(config.get("reverseRemap", False))
         rsmb_blur_val = int(config.get("rsmbVal", 0))
@@ -1377,7 +1403,7 @@ def run_pipeline(config):
             if not IS_RUNNING:
                 break
 
-            clean_file_name = sanitize_filename(filename)
+            clean_file_name = sanitize_filename(os.path.basename(str(filename)))
             base_name, ext = os.path.splitext(clean_file_name)
             prefix = "CrownScaler_Remapped_" if reverse_remap_requested else "CrownScaler_"
             expected_out_name = f"{prefix}{base_name}{ext}"
@@ -1404,7 +1430,9 @@ def run_pipeline(config):
             SYSTEM_STATE["is_remapped"] = reverse_remap_requested
             SYSTEM_STATE["text"] = "Analyzing media sequence..."
 
-            video_path = os.path.join(_I_D_X, filename)
+            video_path = os.path.join(_I_D_X, clean_file_name)
+            if not os.path.isfile(video_path) or not _is_safe_path(video_path):
+                raise ValueError("Input file is missing or invalid.")
             out_name = f"{prefix}{base_name}{ext}"
             output_path = os.path.join(_O_D_X, out_name)
             counter = 1
@@ -1578,7 +1606,7 @@ def run_pipeline(config):
                         if speed_factor != 1.0:
                             ffmpeg_cmd.extend([
                                 "-filter:a",
-                                f"atempo={speed_factor}",
+                                build_atempo_filter(speed_factor),
                             ])
                         ffmpeg_cmd.extend([
                             "-c:a",
