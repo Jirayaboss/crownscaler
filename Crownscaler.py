@@ -1062,14 +1062,34 @@ def interpolate_pair_rife(rife_model, f0_bgr, f1_bgr, multi, device="cuda"):
     t0 = F.pad(t0, padding)
     t1 = F.pad(t1, padding)
 
+    try:
+        rife_version = float(getattr(rife_model, "version", 0))
+    except (TypeError, ValueError):
+        rife_version = 0.0
+
     inter_frames = []
     with torch.no_grad():
         for i in range(1, multi):
             step = i / float(multi)
-            if hasattr(rife_model, "version") and rife_model.version >= 3.9:
+            if rife_version >= 3.9:
                 mid = rife_model.inference(t0, t1, step, 1.0)
             else:
-                mid = rife_model.inference(t0, t1, 1.0)
+                # Older RIFE models do not accept a timestep.  Interpolate the
+                # requested instant from the nearest recursively-generated pair
+                # instead of emitting the same midpoint for every output frame.
+                left, right = t0, t1
+                low, high = 0.0, 1.0
+                while (high - low) > (1.0 / multi):
+                    midpoint = rife_model.inference(left, right, 1.0)
+                    split = (low + high) / 2.0
+                    if step < split:
+                        right, high = midpoint, split
+                    elif step > split:
+                        left, low = midpoint, split
+                    else:
+                        left = right = midpoint
+                        break
+                mid = rife_model.inference(left, right, 1.0)
 
             mid_img = (
                 (mid[0].clamp(0, 1) * 255.0)
@@ -1084,6 +1104,8 @@ def interpolate_pair_rife(rife_model, f0_bgr, f1_bgr, multi, device="cuda"):
 
 
 def remove_dead_frames_list(frame_list, threshold=3.0):
+    import cv2
+
     if len(frame_list) <= 1 or threshold <= 0:
         return frame_list
 
@@ -1101,8 +1123,6 @@ def remove_dead_frames_list(frame_list, threshold=3.0):
             clean_frames.append(curr_frame)
             prev_gray = curr_gray
 
-    if len(clean_frames) < 2:
-        return frame_list
     return clean_frames
 
 
@@ -1276,6 +1296,10 @@ def run_pipeline(config):
         if fps_120_requested:
             SYSTEM_STATE["text"] = "Initializing RIFE 120 FPS Neural Core..."
             rife_model = load_rife_interpolator()
+            if rife_model is None:
+                raise RuntimeError(
+                    "120 FPS interpolation was requested, but the RIFE model could not be initialized."
+                )
 
         lut_x, lut_y = build_microwave_lut()
 
@@ -1669,6 +1693,7 @@ def run_pipeline(config):
                     stop_event = threading.Event()
 
                     def frame_reader():
+                        nonlocal total_frames
                         raw_frames_cache = []
                         need_cache = reverse_remap_requested or remove_dead_requested
 
@@ -1684,8 +1709,15 @@ def run_pipeline(config):
 
                             num_raw = len(raw_frames_cache)
                             if num_raw == 0:
+                                SYSTEM_STATE["frames_total"] = 0
                                 input_queue.put(None)
                                 return
+                            total_frames = (
+                                max(1, (num_raw - 1) * interp_multiplier + 1)
+                                if interp_multiplier > 1 and rife_model is not None
+                                else num_raw
+                            )
+                            SYSTEM_STATE["frames_total"] = total_frames
 
                             prev_f = None
                             if reverse_remap_requested:
@@ -3394,7 +3426,7 @@ html_ui = r"""
                                 <span style="font-size:11px; color:var(--text-muted); font-weight:500;">Interpolates lower-FPS video up to 120 FPS. Automatically skips 120+ FPS clips.</span>
                             </div>
                         </div>
-                        <label class="switch-widget"><input type="checkbox" id="fps120Toggle"><span class="switch-slider"></span></label>
+                        <label class="switch-widget"><input type="checkbox" id="fps120Toggle" onchange="toggleFpsDrawer(this.checked)"><span class="switch-slider"></span></label>
                     </div>
 
                     <!-- EXPANDABLE DROPDOWN FOR 120 FPS -->
@@ -3781,13 +3813,16 @@ html_ui = r"""
         }
     }
 
-    function toggleFpsDrawer() {
+    function toggleFpsDrawer(checked) {
         const drawer = document.getElementById('fpsDrawer');
         const chevron = document.getElementById('fpsChevron');
         if (drawer) {
-            drawer.classList.toggle('expanded');
+            const shouldExpand = typeof checked === 'boolean'
+                ? checked
+                : !drawer.classList.contains('expanded');
+            drawer.classList.toggle('expanded', shouldExpand);
             if (chevron) {
-                chevron.classList.toggle('rotated');
+                chevron.classList.toggle('rotated', shouldExpand);
             }
         }
     }
